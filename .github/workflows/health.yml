@@ -1,0 +1,98 @@
+name: Health Check Filter (Only Working Servers)
+
+on:
+  schedule:
+    - cron: '0 * * * *'
+  workflow_dispatch:
+
+jobs:
+  process:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Download from Davai and health check
+        run: |
+          # Скачиваем все файлы из Davai (clean1.txt ... clean11.txt)
+          ALL_SERVERS=""
+          
+          for i in {1..11}; do
+            URL="https://raw.githubusercontent.com/Cepreu54/Davai/main/clean${i}.txt"
+            echo "Downloading: $URL"
+            
+            DATA=$(curl -sL --connect-timeout 10 "$URL" 2>/dev/null || true)
+            
+            if [ -n "$DATA" ]; then
+              echo "$DATA" >> all_raw.txt
+              echo "  -> Added from clean${i}.txt"
+            fi
+          done
+          
+          # Убираем дубликаты
+          sort -u all_raw.txt > all_unique.txt
+          TOTAL=$(wc -l < all_unique.txt)
+          echo "Total unique servers before health check: $TOTAL"
+          
+          # Проверяем каждый сервер (проверка порта)
+          echo "Starting health check (timeout 3 sec)..."
+          while IFS= read -r server; do
+            # Извлекаем IP/домен из строки vless://...@IP:port
+            HOST=$(echo "$server" | sed -n 's/.*vless:\/\/[^@]*@\([^:]*\).*/\1/p')
+            PORT=$(echo "$server" | sed -n 's/.*:\([0-9]*\)?.*/\1/p')
+            
+            if [ -z "$PORT" ]; then
+              PORT=$(echo "$server" | sed -n 's/.*:\([0-9]*\)#.*/\1/p')
+            fi
+            
+            if [ -n "$HOST" ] && [ -n "$PORT" ]; then
+              # Пробуем подключиться к порту с таймаутом 3 секунды
+              if timeout 3 bash -c "echo >/dev/tcp/$HOST/$PORT" 2>/dev/null; then
+                echo "$server" >> working_servers.txt
+              fi
+            else
+              echo "Skip: cannot parse $server"
+            fi
+          done < all_unique.txt
+          
+          WORKING=$(wc -l < working_servers.txt)
+          echo "Servers alive after health check: $WORKING"
+          
+          if [ "$WORKING" -eq 0 ]; then
+            echo "No working servers found"
+            touch working_servers.txt
+          fi
+
+      - name: Split into files (50 working servers each)
+        run: |
+          TOTAL=$(wc -l < working_servers.txt)
+          echo "Total alive servers: $TOTAL"
+          
+          if [ "$TOTAL" -eq 0 ]; then
+            echo "" > healthy1.txt
+          else
+            # Перемешиваем живые сервера
+            shuf working_servers.txt > shuffled.txt
+            
+            # Разбиваем по 50 серверов на файл (чтобы не перегружать приложение)
+            split -l 50 -d shuffled.txt part_
+            
+            FILE_NUM=1
+            for part in part_*; do
+              if [ -f "$part" ]; then
+                mv "$part" "healthy$FILE_NUM.txt"
+                FILE_NUM=$((FILE_NUM + 1))
+              fi
+            done
+            
+            rm -f shuffled.txt
+          fi
+          rm -f working_servers.txt all_raw.txt all_unique.txt
+
+      - name: Commit and push
+        run: |
+          git config user.name "github-actions"
+          git config user.email "github-actions@github.com"
+          git add healthy*.txt
+          git diff --staged --quiet || git commit -m "Health check $(date +'%Y-%m-%d %H:%M:%S')"
+          git push origin main
